@@ -1,0 +1,19 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+framework = { path = "../framework" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = true, features = [
+	"env-filter",
+	"parking_lot",
+	"smallvec",
+	"fmt",
+	"tracing-log",
+	"std",
+	"ansi",
+] }
+tracing-appender = "0.2.3"
+chrono = "0.4.39"
