@@ -1,107 +1,208 @@
 //! socket
 //!
-//!
+//! 保存socket状态，方法封装
 use mio::event::Source;
-use mio::{Interest, Registry, Token};
+use mio::{Interest, Token};
 use std::io;
 use std::net::SocketAddr;
 
+use crate::util::static_mut_ref;
 // 重新导出
+use crate::REGISTRY;
 pub use mio::net::TcpListener;
 pub use mio::net::TcpStream;
+pub use mio::net::UdpSocket;
 
-use crate::reactor;
-// 保存socket状态，方法封装
+pub struct BorrowedUDPSocket {
+    pub source_id: usize,
+}
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum EndpointType {
     TCPListen,
-    TCPClient,
+    TCPStream,
+    UDPSocket,
 }
 
 // #[derive(Clone)]
 pub enum SocketWrap {
     TCPListen(TcpListener),
-    TCPClient(TcpStream),
+    TCPStream(TcpStream),
+    UDPSocket(UdpSocket, std::net::UdpSocket),
+    BorrowedUDPSocket(UdpSocket),
+}
+
+impl SocketWrap {
+    pub fn get_tcp_listener(&self) -> Option<&TcpListener> {
+        match self {
+            SocketWrap::TCPListen(listener) => Some(listener),
+            SocketWrap::TCPStream(_) => None,
+            SocketWrap::UDPSocket(_, _) => None,
+            SocketWrap::BorrowedUDPSocket(_) => None,
+        }
+    }
+
+    pub fn get_tcp_stream(&self) -> Option<&TcpStream> {
+        match self {
+            SocketWrap::TCPListen(_) => None,
+            SocketWrap::TCPStream(stream) => Some(stream),
+            SocketWrap::UDPSocket(_, _) => None,
+            SocketWrap::BorrowedUDPSocket(_) => None,
+        }
+    }
+
+    pub fn get_udp_socket(&self) -> Option<&UdpSocket> {
+        match self {
+            SocketWrap::TCPListen(_) => None,
+            SocketWrap::TCPStream(_) => None,
+            SocketWrap::UDPSocket(socket, _) => Some(socket),
+            SocketWrap::BorrowedUDPSocket(_) => None,
+        }
+    }
+
+    pub fn get_std_udp_socket(&self) -> Option<&std::net::UdpSocket> {
+        match self {
+            SocketWrap::TCPListen(_) => None,
+            SocketWrap::TCPStream(_) => None,
+            SocketWrap::UDPSocket(_, socket) => Some(socket),
+            SocketWrap::BorrowedUDPSocket(_) => None,
+        }
+    }
+
+    pub fn get_borrow_udp_socket(&self) -> Option<&UdpSocket> {
+        match self {
+            SocketWrap::TCPListen(_) => None,
+            SocketWrap::TCPStream(_) => None,
+            SocketWrap::UDPSocket(_, _) => None,
+            SocketWrap::BorrowedUDPSocket(borrowed_udpsocket) => Some(borrowed_udpsocket),
+        }
+    }
+
+    pub fn is_listener(&self) -> bool {
+        matches!(*self, SocketWrap::TCPListen(_))
+    }
+
+    pub fn is_tcp_stream(&self) -> bool {
+        matches!(*self, SocketWrap::TCPStream(_))
+    }
+
+    pub fn is_udp_socket(&self) -> bool {
+        matches!(*self, SocketWrap::UDPSocket(_, _))
+    }
+
+    pub fn is_borrow_udp_socket(&self) -> bool {
+        matches!(*self, SocketWrap::BorrowedUDPSocket(_))
+    }
 }
 
 pub struct Endpoint {
     // 地址
     pub addr: SocketAddr,
-    pub socket: Option<TcpStream>,
-    pub socket_wrap: Option<SocketWrap>,
-    pub socket_listen: Option<TcpListener>,
+    pub socket_wrap: SocketWrap,
     pub ep_type: EndpointType,
     pub token: usize,
 }
 
 impl Endpoint {
-    pub fn new_tcp_listen(
-        socket: TcpListener,
-        addr: SocketAddr,
-        token: usize,
-    ) -> io::Result<Self> {
-        // 注册事件
-        // let registry = &reactor::Reactor::get().registry;
-        // socket.register(registry, Token(token), Interest::READABLE)?;
-
+    pub fn new_tcp_listen(socket: TcpListener, addr: SocketAddr, token: usize) -> io::Result<Self> {
         Ok(Self {
             addr: addr,
-            socket: None,
-            socket_listen: Some(socket),
-            socket_wrap: None,
+            socket_wrap: SocketWrap::TCPListen(socket),
             ep_type: EndpointType::TCPListen,
             token,
         })
     }
 
-    pub fn new_tcp_client(
-        socket: TcpStream,
+    pub fn new_tcp_client(socket: TcpStream, addr: SocketAddr, token: usize) -> io::Result<Self> {
+        Ok(Self {
+            addr: addr,
+            socket_wrap: SocketWrap::TCPStream(socket),
+            ep_type: EndpointType::TCPStream,
+            token,
+        })
+    }
+
+    pub fn new_udp_socket(
+        std_socket: std::net::UdpSocket,
+        socket: UdpSocket,
         addr: SocketAddr,
         token: usize,
     ) -> io::Result<Self> {
-        // 注册事件
-        // let registry = &reactor::Reactor::get().registry;
-        // socket.register(
-        //     registry,
-        //     Token(token),
-        //     Interest::READABLE.add(Interest::WRITABLE),
-        // )?;
         Ok(Self {
             addr: addr,
-            socket: Some(socket),
-            socket_listen: None,
-            socket_wrap: None,
-            ep_type: EndpointType::TCPClient,
+            socket_wrap: SocketWrap::UDPSocket(socket, std_socket),
+            ep_type: EndpointType::UDPSocket,
+            token,
+        })
+    }
+
+    pub fn new_borrow_udp_socket(
+        socket: UdpSocket,
+        addr: SocketAddr,
+        token: usize,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            addr: addr,
+            socket_wrap: SocketWrap::BorrowedUDPSocket(socket),
+            ep_type: EndpointType::UDPSocket,
             token,
         })
     }
 
     pub fn register(&mut self) -> io::Result<()> {
-        match self.ep_type {
-            EndpointType::TCPListen => {
+        match &mut self.socket_wrap {
+            SocketWrap::TCPListen(socket) => {
                 // 注册事件
-                let registry = &reactor::Reactor::get().registry;
-                if let Some(mut socket) = self.socket_listen.take() {
-                    socket.register(registry, Token(self.token), Interest::READABLE)?;
-                    self.socket_listen = Some(socket);
-                } else {
-                    return Err(std::io::Error::other("not init"));
-                }
+                socket.register(
+                    static_mut_ref!(REGISTRY).as_ref().unwrap(),
+                    Token(self.token),
+                    Interest::READABLE,
+                )?;
             }
-            EndpointType::TCPClient => {
-                let registry = &reactor::Reactor::get().registry;
-                if let Some(mut socket) = self.socket.take() {
-                    socket.register(
-                        registry,
-                        Token(self.token),
-                        Interest::READABLE.add(Interest::WRITABLE),
-                    )?;
-                    self.socket = Some(socket);
-                } else {
-                    return Err(std::io::Error::other("not init"));
-                }
+            SocketWrap::TCPStream(socket) => {
+                socket.register(
+                    static_mut_ref!(REGISTRY).as_ref().unwrap(),
+                    Token(self.token),
+                    Interest::READABLE.add(Interest::WRITABLE),
+                )?;
             }
+            SocketWrap::UDPSocket(socket, _) => {
+                socket.register(
+                    static_mut_ref!(REGISTRY).as_ref().unwrap(),
+                    Token(self.token),
+                    Interest::READABLE,
+                )?;
+            }
+            SocketWrap::BorrowedUDPSocket(_) => {}
+        }
+        Ok(())
+    }
+
+    pub fn reregister(&mut self) -> io::Result<()> {
+        match &mut self.socket_wrap {
+            SocketWrap::TCPListen(socket) => {
+                // 注册事件
+                socket.reregister(
+                    static_mut_ref!(REGISTRY).as_ref().unwrap(),
+                    Token(self.token),
+                    Interest::READABLE,
+                )?;
+            }
+            SocketWrap::TCPStream(socket) => {
+                socket.reregister(
+                    static_mut_ref!(REGISTRY).as_ref().unwrap(),
+                    Token(self.token),
+                    Interest::READABLE.add(Interest::WRITABLE),
+                )?;
+            }
+            SocketWrap::UDPSocket(socket, _) => {
+                socket.reregister(
+                    static_mut_ref!(REGISTRY).as_ref().unwrap(),
+                    Token(self.token),
+                    Interest::READABLE,
+                )?;
+            }
+            SocketWrap::BorrowedUDPSocket(_) => {}
         }
         Ok(())
     }
@@ -111,14 +212,13 @@ impl Endpoint {
             return Ok(true);
         }
         // If we hit an error while connecting return that error.
-        if let Ok(Some(err)) | Err(err) = self.socket.as_ref().unwrap().take_error() {
+        if let Ok(Some(err)) | Err(err) = self.socket_wrap.get_tcp_stream().unwrap().take_error() {
             tracing::error!("is_connected_as_client - err:{:?}", err);
             return Err(err);
         }
-
         // If we can get a peer address it means the stream is
         // connected.
-        match self.socket.as_ref().unwrap().peer_addr() {
+        match self.socket_wrap.get_tcp_stream().unwrap().peer_addr() {
             Ok(addr) => {
                 // #[allow(unused_mut)]
                 // let mut stream = TcpStream { socket };
@@ -128,7 +228,7 @@ impl Endpoint {
                 //         warn!("failed to set CPU affinity on TcpStream: {}", err);
                 //     }
                 // }
-                tracing::error!("is_connected_as_client - addr:{:?}", addr);
+                tracing::trace!("is_connected_as_client - addr:{:?}", addr);
                 Ok(true)
             }
             // `NotConnected` (`ENOTCONN`) means the socket not yet
@@ -151,77 +251,17 @@ impl Endpoint {
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        match self.ep_type {
-            EndpointType::TCPListen => {
-                let registry = &reactor::Reactor::get().registry;
-                if let Some(mut socket) = self.socket_listen.take() {
-                    let _ = socket.deregister(registry);
-                }
+        match &mut self.socket_wrap {
+            SocketWrap::TCPListen(socket) => {
+                let _ = socket.deregister(static_mut_ref!(REGISTRY).as_ref().unwrap());
             }
-            EndpointType::TCPClient => {
-                let registry = &reactor::Reactor::get().registry;
-                if let Some(mut socket) = self.socket.take() {
-                    tracing::trace!("Endpint drop - deregister addr:{:?}", socket.peer_addr());
-                    let _ = socket.deregister(registry);
-                }
+            SocketWrap::TCPStream(socket) => {
+                let _ = socket.deregister(static_mut_ref!(REGISTRY).as_ref().unwrap());
             }
+            SocketWrap::UDPSocket(socket, _) => {
+                let _ = socket.deregister(static_mut_ref!(REGISTRY).as_ref().unwrap());
+            }
+            SocketWrap::BorrowedUDPSocket(_) => {}
         }
-    }
-}
-
-impl Source for Endpoint {
-    fn register(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        // Delegate the `register` call to `socket`
-        if let Some(socket) = &mut self.socket_wrap {
-            match socket {
-                SocketWrap::TCPListen(tcp_listener) => {
-                    tcp_listener.register(registry, token, interests)?;
-                }
-                SocketWrap::TCPClient(tcp_stream) => {
-                    tcp_stream.register(registry, token, interests)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn reregister(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        // Delegate the `reregister` call to `socket`
-        if let Some(socket) = &mut self.socket_wrap {
-            match socket {
-                SocketWrap::TCPListen(tcp_listener) => {
-                    tcp_listener.reregister(registry, token, interests)?;
-                }
-                SocketWrap::TCPClient(tcp_stream) => {
-                    tcp_stream.reregister(registry, token, interests)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-        // Delegate the `deregister` call to `socket`
-        if let Some(socket) = &mut self.socket_wrap {
-            match socket {
-                SocketWrap::TCPListen(tcp_listener) => {
-                    tcp_listener.deregister(registry)?;
-                }
-                SocketWrap::TCPClient(tcp_stream) => {
-                    tcp_stream.deregister(registry)?;
-                }
-            }
-        }
-        Ok(())
     }
 }

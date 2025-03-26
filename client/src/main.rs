@@ -1,3 +1,5 @@
+use std::thread::sleep;
+
 use chrono::prelude::*;
 use framework::{init_io_thread, timer};
 
@@ -6,6 +8,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 fn init_log() {
+    std::env::set_var("RUST_BACKTRACE", "1");
+
     // 给日志库设置环境变量
     if std::env::var_os("RUST_LOG").is_none() {
         std::env::set_var("RUST_LOG", "debug")
@@ -33,52 +37,70 @@ fn init_log() {
 
 fn main() {
     init_log();
-    init_io_thread();
+    init_io_thread(&framework::net::NetConfig::default());
     let addr = "127.0.0.1:9000".parse().unwrap();
-    // if let Ok(channel_id) = net_framework::create_server(addr) {
-    //     println!("create server success channel_id:{}", channel_id);
-    // }
+
     let recv = framework::get_recv_msg_channel();
-    let timerMgr = timer::TimerManager::new();
+    let timer_mgr = timer::TimerManager::new();
     use std::time::{Duration, Instant};
     println!("Hello, world! now: {:?}", Utc::now().timestamp_millis());
-    timerMgr.insert_timer(
-        1,
-        Instant::now() + Duration::from_secs(5),
+    timer_mgr.insert_timer(
+        Duration::from_secs(5),
         Box::new(|| {
-            println!("Hello, world! after 5 now: {:?}", Utc::now().timestamp_millis());
+            println!(
+                "Hello, world! after 5 now: {:?}",
+                Utc::now().timestamp_millis()
+            );
         }),
+        false,
     );
 
-
-    for i in 0..1 {
-        if let Ok(id) = framework::create_client(addr) {
-            println!("create client success channel_id:{}", id);
-        } else {
-            println!("create client failed channel_id:");
-        }
+    for _ in 0..1 {
+        let _ = std::thread::Builder::new()
+            .name("io_thread".to_string())
+            .spawn(move || {
+                for _ in 0..1 {
+                    match framework::create_udp_client(
+                        addr,
+                        framework::net::channel::ChannelOption {
+                            filter_flags: framework::net::channel::FilterFlags::RAW_BYTE,
+                        },
+                    ) {
+                        Ok(id) => {
+                            println!("create client success channel_id:{}", id);
+                        }
+                        Err(e) => {
+                            println!("create client failed e:{:?}", e);
+                        }
+                    }
+                }
+            });
     }
     loop {
         let len = recv.len();
         // println!("recv msg len: {}", len);
-        // for i in 0..len {
-        //     let msg = recv.recv().unwrap();
-        //     if msg.msg.msg_id == net_framework::message::FixedMessageId::Connected.as_i32() {
-        //         net_framework::send_msg(
-        //             msg.channel_id,
-        //             net_framework::message::MessagePacket {
-        //                 msg_id: 1,
-        //                 buf: [0; 100].to_vec(),
-        //             },
-        //         );
-        //     }
-        //     // println!("recv msg idx: {} | msg:{:?}", i, recv.recv().unwrap());
-        // }
-        let mut cb = Vec::new();
-        timerMgr.process_timers(&mut cb);
-        if cb.len() > 0 {
-            cb[0]();
+        for i in 0..len {
+            let msg = recv.recv().unwrap();
+            println!(
+                "recv msg idx: {} | msg:{:?}",
+                i,
+                String::from_utf8(msg.msg.buf)
+            );
+            if msg.msg.msg_id == framework::net::message::FixedMessageId::Connected.as_i32() || true
+            {
+                framework::send_msg(
+                    msg.channel_id,
+                    framework::net::message::MessagePacket {
+                        msg_id: 1,
+                        buf: format!("client id: {} - ping", msg.channel_id)
+                            .as_bytes()
+                            .to_vec(),
+                    },
+                );
+            }
+            // println!("recv msg idx: {} | msg:{:?}", i, recv.recv().unwrap());
         }
-        // sleep(Duration::from_secs(1));
+        timer_mgr.update();
+        sleep(Duration::from_millis(1000));
     }
 }
